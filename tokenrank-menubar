@@ -50,7 +50,7 @@ SEV = [(85, "#ff3b30"), (60, "#f7b500"), (0, "#34c759")]
 # 趋势图堆叠用各工具品牌色（与 Token Monitor BRAND_VENDOR_COLORS 同步）
 TOOL_COLORS = {"claude-code": "#cc7c5e", "claude": "#cc7c5e", "codex": "#49a3b0",
                "hermes": "#d4af37", "cursor": "#6ab4f0", "gemini": "#4285f4",
-               "antigravity": "#a57df0", "openclaw": "#f06a7b", "kimi": "#16191e"}
+               "antigravity": "#a57df0", "openclaw": "#f06a7b", "kimi": "#6a5af9"}
 TOOL_FALLBACK = "#8e8e93"
 
 SCALE = 2        # @2x 渲染 + 144dpi → retina 清晰
