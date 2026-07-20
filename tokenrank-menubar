@@ -142,6 +142,19 @@ def sev_color(used):
     return SEV[-1][1]
 
 
+# 百分比文字专用高对比色板：条可以鲜亮，文字得更深/更饱和才不被磨砂+壁纸洗淡
+SEV_TEXT_LIGHT = [(85, "#d70015"), (60, "#b25000"), (0, "#1e8e3e")]
+SEV_TEXT_DARK = [(85, "#ff6259"), (60, "#ffd60a"), (0, "#30d158")]
+
+
+def sev_text_color(used, dark):
+    palette = SEV_TEXT_DARK if dark else SEV_TEXT_LIGHT
+    for thresh, color in palette:
+        if used >= thresh:
+            return color
+    return palette[-1][1]
+
+
 def pct(v):
     try:
         v = float(v)
@@ -538,11 +551,11 @@ def render_panel(usage, cost, cl, cx, rank, dark):
             # 百分比：主=大号+始终跟随状态色；次=小号灰，≥60 才变色报警
             if primary:
                 c.text(c.W - c.pad, c.y - 1 * SCALE, f"{w['used']}%", 13.5,
-                       sev_color(w["used"]), "Semibold", anchor="ra")
+                       sev_text_color(w["used"], c.dark), "Semibold", anchor="ra")
             else:
                 warn = w["used"] >= SEV[1][0]
                 c.text(c.W - c.pad, c.y, f"{w['used']}%", 11.5,
-                       sev_color(w["used"]) if warn else c.SUB, "Semibold", anchor="ra")
+                       sev_text_color(w["used"], c.dark) if warn else c.SUB, "Semibold", anchor="ra")
             c.y += 16 * SCALE
             cd = countdown(w.get("reset_at"))
             if cd:
