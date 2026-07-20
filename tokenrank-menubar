@@ -54,8 +54,6 @@ TOOL_FALLBACK = "#8e8e93"
 
 SCALE = 2        # @2x 渲染 + 144dpi → retina 清晰
 PANEL_W = 300    # pt
-# 面板衬底不透明度 0-255：0=全透明(受壁纸影响)，255=实心块。225≈88%，强压壁纸仅留一丝通透
-PANEL_BG_ALPHA = 225
 
 
 def is_dark():
@@ -427,14 +425,12 @@ class Canvas:
             self.TEXT, self.SUB = "#f5f5f7", "#a8a8ae"
             self.TRACK, self.DIV = (255, 255, 255, 56), (255, 255, 255, 40)
             self.BLUE = "#6ab4f5"
-            self.BG = (28, 28, 30, PANEL_BG_ALPHA)
         else:
             self.TEXT, self.SUB = "#111111", "#5f5f64"
             self.TRACK, self.DIV = (0, 0, 0, 34), (0, 0, 0, 26)
             self.BLUE = "#1a56db"
-            self.BG = (255, 255, 255, PANEL_BG_ALPHA)
         self.W = PANEL_W * SCALE
-        self.img = Image.new("RGBA", (self.W, guess_h * SCALE), self.BG)
+        self.img = Image.new("RGBA", (self.W, guess_h * SCALE), (0, 0, 0, 0))
         self.dr = ImageDraw.Draw(self.img)
         self.y = 6 * SCALE
         self.pad = 12 * SCALE
