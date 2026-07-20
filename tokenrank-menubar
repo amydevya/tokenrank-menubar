@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+# <bitbar.title>tokenrank-menubar</bitbar.title>
+# <swiftbar.hideAbout>true</swiftbar.hideAbout>
+# <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
+# <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
+# <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
+# <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
+"""tokenrank-menubar — 自包含的 Mac 菜单栏用量/额度小工具（SwiftBar 插件格式）。
+
+v3.0: 面板拆成多个透明图片块。主体不可点(无悬停高亮)；每个模型的额度块可点=刷新
+(悬停只高亮小块)，模型名后画手绘 ⟳ 图标提示。趋势图按官方 console 风格：
+每日柱、按工具堆叠+品牌色、细网格线、稀疏数值标签、tooltip 逐日明细。
+
+数据源全部直连真源，不依赖 tokenrank / Token Monitor 的登录：
+  · 今日用量+近7天(tokenrank口径 normalized) : opentoken preview（本地日志）
+  · Codex 5h/weekly                          : ~/.codex/sessions 最新 rate_limits（本地，零鉴权）
+  · Claude 5h/weekly                         : Keychain → api.anthropic.com/api/oauth/usage（5分钟缓存+退避）
+  · 成本                                      : Token Monitor 的 collector-anchor.json（本地文件）
+  · 排名(可选)                                : scys.com + 已存 user_id
+"""
+import base64
+import glob
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+
+HOME = Path.home()
+OPENTOKEN = HOME / ".local/bin/opentoken"
+ANCHOR = HOME / "Library/Application Support/Token Monitor/collector-anchor.json"
+CODEX_SESSIONS = HOME / ".codex/sessions"
+USER_ID_FILE = HOME / ".opentoken/user_id"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+UA = "tokenrank-menubar/3.0"
+CLAUDE_TRAY_SRC = Path("/Applications/Claude.app/Contents/Resources/TrayIconTemplate@3x.png")
+CACHE_DIR = HOME / ".cache/tokenrank-menubar"
+ICON_CACHE = CACHE_DIR / "claude-tray.png"
+CLAUDE_CACHE = CACHE_DIR / "claude-limits.json"
+CLAUDE_TTL = 300     # 额度变化慢，5 分钟缓存；插件每 60s 跑但不会每次打 API
+CLAUDE_RETRY = 120   # 失败(如429限流)后至少隔 2 分钟再试
+
+# 额度进度条阈值：默认绿，≥60 黄，≥85 红（Claude/Codex 统一）
+SEV = [(85, "#ff3b30"), (60, "#f7b500"), (0, "#34c759")]
+# 趋势图堆叠用各工具品牌色（与 Token Monitor BRAND_VENDOR_COLORS 同步）
+TOOL_COLORS = {"claude-code": "#cc7c5e", "claude": "#cc7c5e", "codex": "#49a3b0",
+               "hermes": "#d4af37", "cursor": "#6ab4f0", "gemini": "#4285f4",
+               "antigravity": "#a57df0", "openclaw": "#f06a7b"}
+TOOL_FALLBACK = "#8e8e93"
+
+SCALE = 2        # @2x 渲染 + 144dpi → retina 清晰
+PANEL_W = 300    # pt
+
+
+def is_dark():
+    v = os.environ.get("OS_APPEARANCE")
+    if v:
+        return v.lower().startswith("d")
+    try:
+        out = subprocess.check_output(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                                      text=True, stderr=subprocess.DEVNULL, timeout=3).strip()
+        return out == "Dark"
+    except Exception:
+        return False
+
+
+# ---------- helpers ----------
+def fmt_tokens(n):
+    n = int(n or 0)
+    if n >= 100_000_000:
+        return f"{n/100_000_000:.2f}亿"
+    if n >= 10_000:
+        return f"{n/10_000:.1f}万"
+    return f"{n:,}"
+
+
+def fmt_short(n):
+    """坐标轴刻度用：300万 / 1.5亿，无多余小数。"""
+    if n >= 100_000_000:
+        return f"{n/100_000_000:g}亿"
+    if n >= 10_000:
+        return f"{n/10_000:g}万"
+    return f"{n:g}"
+
+
+def nice_ticks(mx, target=3):
+    """好看的整数刻度：步长取 1/2/2.5/5×10^k，如 300万/600万/900万。"""
+    if mx <= 0:
+        return 1, []
+    raw = mx / target
+    mag = 10 ** math.floor(math.log10(raw))
+    step = mag
+    for m in (1, 2, 2.5, 5, 10):
+        step = m * mag
+        if raw <= step:
+            break
+    top = math.ceil(mx / step) * step
+    return top, [step * i for i in range(1, round(top / step) + 1)]
+
+
+def today_str():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def parse_dt(value):
+    if value in (None, "", 0):
+        return None
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            return datetime.fromtimestamp(int(float(value)))
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.astimezone().replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def countdown(value):
+    dt = parse_dt(value)
+    if not dt:
+        return ""
+    secs = int((dt - datetime.now()).total_seconds())
+    if secs <= 0:
+        return "即将重置"
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    if d > 0:
+        return f"{d}d:{h}h"
+    if h > 0:
+        return f"{h}h:{m}m"
+    return f"{m}m"
+
+
+def sev_color(used):
+    for thresh, color in SEV:
+        if used >= thresh:
+            return color
+    return SEV[-1][1]
+
+
+def pct(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    if 0 < v <= 1.0:
+        v *= 100
+    return round(v)
+
+
+# ---------- 数据采集 ----------
+def load_usage(days=7):
+    """今日总量/分工具 + 近 N 天逐日分工具 normalized。"""
+    if not OPENTOKEN.exists():
+        return None
+    day = today_str()
+    since = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    try:
+        raw = subprocess.check_output(
+            [str(OPENTOKEN), "preview", "--since", since, "--json"],
+            text=True, stderr=subprocess.DEVNULL, timeout=15,
+        )
+        data = json.loads(raw)
+    except Exception:
+        return None
+    day_tool = {}
+    for row in data.get("rows", []):
+        d = row.get("date")
+        tool = row.get("tool") or "unknown"
+        n = int(row.get("normalized") or 0)
+        day_tool.setdefault(d, {})
+        day_tool[d][tool] = day_tool[d].get(tool, 0) + n
+    daily = []
+    for i in range(days - 1, -1, -1):
+        ds = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        daily.append((ds, day_tool.get(ds, {})))
+    tools = day_tool.get(day, {})
+    return {"total": sum(tools.values()), "tools": tools, "daily": daily}
+
+
+def load_cost():
+    try:
+        d = json.loads(ANCHOR.read_text())
+    except Exception:
+        return None
+    t = d.get("today", {})
+    m = d.get("month", {})
+    return {"today": float(t.get("costUsd") or 0), "month": float(m.get("costUsd") or 0)}
+
+
+def codex_limits():
+    files = sorted(glob.glob(str(CODEX_SESSIONS / "**/*.jsonl"), recursive=True),
+                   key=lambda p: os.path.getmtime(p), reverse=True)[:8]
+    best_ts, best = None, None
+    for f in files:
+        try:
+            lines = Path(f).read_text(errors="ignore").splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            rl = _find(o, "rate_limits")
+            ts = _find(o, "timestamp")
+            if rl and (best_ts is None or str(ts) > str(best_ts)):
+                best_ts, best = ts, rl
+            break
+    if not best:
+        return None
+    out = []
+    for name in ("primary", "secondary"):
+        w = best.get(name)
+        if not isinstance(w, dict):
+            continue
+        up = pct(w.get("used_percent"))
+        if up is None:
+            continue
+        mins = int(w.get("window_minutes") or w.get("window_duration_mins") or 0)
+        kind = "weekly" if (mins >= 7 * 24 * 60 or name == "secondary") else "5h"
+        out.append({"kind": kind, "used": up, "reset_at": w.get("resets_at")})
+    return out or None
+
+
+def _find(o, key):
+    if isinstance(o, dict):
+        if key in o:
+            return o[key]
+        for v in o.values():
+            r = _find(v, key)
+            if r is not None:
+                return r
+    elif isinstance(o, list):
+        for v in o:
+            r = _find(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+def claude_access_token():
+    try:
+        raw = subprocess.check_output(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            text=True, stderr=subprocess.DEVNULL, timeout=8,
+        ).strip()
+    except Exception:
+        return None
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None
+    oauth = d.get("claudeAiOauth") or d.get("oauth") or d
+    tok = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    return str(tok) if tok else None
+
+
+def _claude_fetch():
+    tok = claude_access_token()
+    if not tok:
+        return None
+    req = urllib.request.Request(CLAUDE_USAGE_URL, headers={
+        "accept": "application/json",
+        "authorization": f"Bearer {tok}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "user-agent": UA,
+    })
+    with urllib.request.urlopen(req, timeout=6) as r:
+        usage = json.loads(r.read().decode())
+    out = []
+    for field, kind in (("five_hour", "5h"), ("seven_day", "weekly")):
+        w = usage.get(field)
+        if not isinstance(w, dict):
+            continue
+        up = pct(w.get("utilization", w.get("percent", w.get("used_percent"))))
+        if up is None:
+            continue
+        out.append({"kind": kind, "used": up, "reset_at": w.get("resets_at")})
+    return out or None
+
+
+def _cache_write(data):
+    """原子写：定时跑和手动跑可能并发，write_text 写一半会被读成坏 JSON。"""
+    CLAUDE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CLAUDE_CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, CLAUDE_CACHE)
+
+
+def claude_limits():
+    """带缓存: 5 分钟内直接用上次结果；失败(429限流等)沿用旧值并退避 2 分钟。"""
+    now = time.time()
+    cached = {}
+    try:
+        cached = json.loads(CLAUDE_CACHE.read_text())
+    except Exception:
+        pass
+    if cached.get("windows") and now - cached.get("ts", 0) < CLAUDE_TTL:
+        return cached["windows"]
+    if now - cached.get("attempt_ts", 0) < CLAUDE_RETRY:
+        return cached.get("windows") or None
+    try:
+        wins = _claude_fetch()
+    except Exception:
+        wins = None
+    try:
+        if wins:
+            _cache_write({"ts": now, "attempt_ts": now, "windows": wins})
+            return wins
+        cached["attempt_ts"] = now      # windows 原样保留，绝不清掉旧数据
+        _cache_write(cached)
+    except Exception:
+        pass
+    return cached.get("windows") or None
+
+
+def load_rank():
+    try:
+        uid = USER_ID_FILE.read_text().strip()
+    except Exception:
+        return None
+    url = f"https://scys.com/tokenrank/api/subapp/leaderboard?board=total&range=today&me={uid}&limit=1"
+    try:
+        raw = subprocess.check_output(["curl", "-fsSL", "--max-time", "5", url],
+                                      text=True, stderr=subprocess.DEVNULL, timeout=8)
+        b = json.loads(raw)
+    except Exception:
+        return None
+    entry = b.get("myRank")
+    total = b.get("totalMembers")
+    if not entry or not total:
+        return None
+    rank = int(entry.get("rank") or 0)
+    top = max(0, min(100, round((1 - rank / total) * 100)))
+    return {"rank": rank, "total": int(total), "top": top}
+
+
+def claude_icon():
+    src = CLAUDE_TRAY_SRC
+    if not src.exists():
+        return None
+    try:
+        stale = (not ICON_CACHE.exists()) or ICON_CACHE.stat().st_mtime < src.stat().st_mtime
+        if stale:
+            ICON_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["sips", "-s", "format", "png", "-z", "36", "36",
+                            str(src), "--out", str(ICON_CACHE)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            subprocess.run(["sips", "-s", "dpiHeight", "144", "-s", "dpiWidth", "144", str(ICON_CACHE)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        return base64.b64encode(ICON_CACHE.read_bytes()).decode()
+    except Exception:
+        return None
+
+
+# ---------- 画布 ----------
+# PingFang 候选：新 macOS 系统字体不可直读，飞书自带一份可用副本；都没有则退 Hiragino/黑体
+_PF_CANDIDATES = [
+    HOME / "Library/Containers/com.bytedance.macos.feishu/Data/Library/Application Support/com.electron.lark.font_workaround/PingFang.ttc",
+    Path("/System/Library/Fonts/PingFang.ttc"),
+    Path("/Library/Fonts/PingFang.ttc"),
+]
+_FALLBACKS = [  # (路径, {粗细: ttc索引})
+    (Path("/System/Library/Fonts/Hiragino Sans GB.ttc"), {"Regular": 0, "Medium": 2, "Semibold": 2}),
+    (Path("/System/Library/Fonts/STHeiti Medium.ttc"), {"Regular": 1, "Medium": 1, "Semibold": 1}),
+]
+_FONTS = {}
+
+
+def _font(size, weight="Regular"):
+    from PIL import ImageFont
+    key = (size, weight)
+    if key in _FONTS:
+        return _FONTS[key]
+    px = round(size * SCALE)
+    f = None
+    for pf in _PF_CANDIDATES:
+        if not pf.exists():
+            continue
+        try:  # 在 ttc 里按字体名定位 PingFang SC 对应字重
+            for i in range(24):
+                cand = ImageFont.truetype(str(pf), px, index=i)
+                fam, style = cand.getname()
+                if "PingFang SC" in fam and style == weight:
+                    f = cand
+                    break
+            if f:
+                break
+        except Exception:
+            continue
+    if not f:
+        for path, idx in _FALLBACKS:
+            if not path.exists():
+                continue
+            try:
+                f = ImageFont.truetype(str(path), px, index=idx.get(weight, 0))
+                break
+            except Exception:
+                continue
+    if not f:
+        f = ImageFont.load_default()
+    _FONTS[key] = f
+    return f
+
+
+class Canvas:
+    """一个透明图片块。所有坐标用 pt，内部乘 SCALE。"""
+
+    def __init__(self, dark, guess_h=400):
+        from PIL import Image, ImageDraw
+        self.dark = dark
+        if dark:
+            self.TEXT, self.SUB = "#f5f5f7", "#a8a8ae"
+            self.TRACK, self.DIV = (255, 255, 255, 56), (255, 255, 255, 40)
+            self.BLUE = "#6ab4f5"
+        else:
+            self.TEXT, self.SUB = "#111111", "#5f5f64"
+            self.TRACK, self.DIV = (0, 0, 0, 34), (0, 0, 0, 26)
+            self.BLUE = "#1a56db"
+        self.W = PANEL_W * SCALE
+        self.img = Image.new("RGBA", (self.W, guess_h * SCALE), (0, 0, 0, 0))
+        self.dr = ImageDraw.Draw(self.img)
+        self.y = 6 * SCALE
+        self.pad = 12 * SCALE
+
+    def text(self, x, y, s, size, color, weight="Regular", anchor="la"):
+        self.dr.text((x, y), s, font=_font(size, weight), fill=color, anchor=anchor)
+
+    def tw(self, s, size, weight="Regular"):
+        return self.dr.textlength(s, font=_font(size, weight))
+
+    def divider(self):
+        self.y += 10 * SCALE
+        self.dr.line([(self.pad, self.y), (self.W - self.pad, self.y)], fill=self.DIV, width=SCALE)
+        self.y += 11 * SCALE
+
+    def dashed_hline(self, x0, x1, yy, dash=3, gap=3):
+        x = x0
+        while x < x1:
+            self.dr.line([(x, yy), (min(x + dash * SCALE, x1), yy)], fill=self.DIV, width=SCALE)
+            x += (dash + gap) * SCALE
+
+    def refresh_icon(self, cx, cy, r):
+        """手绘 ⟳：圆弧+箭头，不依赖字体。"""
+        sw = max(round(1.4 * SCALE), 2)
+        self.dr.arc([cx - r, cy - r, cx + r, cy + r], start=-50, end=230, fill=self.SUB, width=sw)
+        ang = math.radians(230)
+        tx, ty = cx + r * math.cos(ang), cy + r * math.sin(ang)
+        tang = (-math.sin(ang), math.cos(ang))                     # 顺时针切线方向
+        norm = (math.cos(ang), math.sin(ang))
+        ah, aw = 3.2 * SCALE, 2.4 * SCALE
+        p1 = (tx + tang[0] * ah, ty + tang[1] * ah)
+        p2 = (tx + norm[0] * aw, ty + norm[1] * aw)
+        p3 = (tx - norm[0] * aw, ty - norm[1] * aw)
+        self.dr.polygon([p1, p2, p3], fill=self.SUB)
+
+    def save(self, path):
+        img = self.img.crop((0, 0, self.W, self.y + 4 * SCALE))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(path, dpi=(72 * SCALE, 72 * SCALE))
+        return base64.b64encode(path.read_bytes()).decode()
+
+
+# ---------- 各图片块 ----------
+def render_strip(dark):
+    """顶部窄条：左标题 + 右侧 ⟳ 图标。整条点击 = 刷新（图标即可见affordance，无隐藏快捷键）。"""
+    c = Canvas(dark, guess_h=26)
+    c.y = 5 * SCALE
+    c.text(c.pad, c.y, "今日用量 · tokenrank 口径", 11, c.SUB, "Medium")
+    c.refresh_icon(c.W - c.pad - 6 * SCALE, c.y + 7 * SCALE, 5.5 * SCALE)
+    c.y += 17 * SCALE
+    return c.save(CACHE_DIR / "strip.png")
+
+
+def render_panel(usage, cost, cl, cx, rank, dark):
+    """主面板：总量/排名/分工具 + 成本 + 额度 + 趋势。一整块，不可点击(无悬停高亮)。"""
+    c = Canvas(dark, guess_h=520)
+
+    # ── 总量 + 排名 ──
+    total_s = fmt_tokens(usage["total"]) if usage else "—"
+    c.text(c.pad, c.y, total_s, 23, c.TEXT, "Semibold")
+    if rank:
+        c.text(c.W - c.pad, c.y + 8 * SCALE, f"#{rank['rank']} · top {rank['top']}%",
+               12, c.BLUE, "Semibold", anchor="ra")
+    c.y += 34 * SCALE
+    if usage and usage["tools"]:
+        tools = "   ".join(f"{t} {fmt_tokens(v)}" for t, v in sorted(usage["tools"].items()))
+        c.text(c.pad, c.y, tools, 11.5, c.TEXT, "Medium")
+        c.y += 17 * SCALE
+    c.divider()
+
+    # ── 成本 ──
+    if cost:
+        c.text(c.pad, c.y, "成本", 11, c.SUB, "Medium")
+        c.text(c.pad + 40 * SCALE, c.y - 1 * SCALE,
+               f"今日 ${cost['today']:.2f}    本月 ${cost['month']:,.2f}", 12.5, c.TEXT, "Semibold")
+        c.y += 19 * SCALE
+        c.divider()
+
+    # ── 额度 ──
+    c.text(c.pad, c.y, "额度 · 5h / weekly", 11, c.SUB, "Medium")
+    c.y += 21 * SCALE
+    bar_x = c.pad + 52 * SCALE
+    bar_w = c.W - c.pad - 42 * SCALE - bar_x
+    for label, wins in (("Claude", cl), ("Codex", cx)):
+        c.text(c.pad, c.y, label, 12, c.TEXT, "Semibold")
+        c.y += 19 * SCALE
+        if wins is None:
+            note = "暂不可用（API限流，稍后自动恢复）" if label == "Claude" else "本地暂无 rate_limits"
+            c.text(c.pad + 6 * SCALE, c.y, note, 10.5, c.SUB)
+            c.y += 19 * SCALE
+            continue
+        for w in wins:
+            cy = c.y + 6 * SCALE
+            c.text(c.pad + 6 * SCALE, c.y, w["kind"], 11, c.SUB, "Medium")
+            bh = 7 * SCALE
+            c.dr.rounded_rectangle([bar_x, cy - bh // 2, bar_x + bar_w, cy + bh // 2],
+                                   radius=bh // 2, fill=c.TRACK)
+            fw = max(int(bar_w * min(w["used"], 100) / 100), bh if w["used"] > 0 else 0)
+            if fw:
+                c.dr.rounded_rectangle([bar_x, cy - bh // 2, bar_x + fw, cy + bh // 2],
+                                       radius=bh // 2, fill=sev_color(w["used"]))
+            c.text(c.W - c.pad, c.y, f"{w['used']}%", 12, c.TEXT, "Semibold", anchor="ra")
+            c.y += 16 * SCALE
+            cd = countdown(w.get("reset_at"))
+            if cd:
+                c.text(bar_x, c.y, f"重置 {cd}", 9.5, c.SUB)
+                c.y += 15 * SCALE
+            else:
+                c.y += 3 * SCALE
+        c.y += 4 * SCALE
+
+    # ── 近 7 天趋势（官方 console 风格：堆叠+品牌色、网格线、克制的数值标注） ──
+    daily = (usage or {}).get("daily") or []
+    if len(daily) >= 2:
+        c.divider()
+        week_tot = {}
+        for _, tools in daily:
+            for t, v in tools.items():
+                week_tot[t] = week_tot.get(t, 0) + v
+        order = sorted(week_tot, key=week_tot.get, reverse=True)
+        colors = {t: TOOL_COLORS.get(t, TOOL_FALLBACK) for t in order}
+
+        c.text(c.pad, c.y, "近 7 天用量", 11, c.SUB, "Medium")
+        lx = c.W - c.pad
+        for t in reversed(order[:3]):                 # 图例右对齐
+            c.text(lx, c.y + 1 * SCALE, t, 9, c.SUB, anchor="ra")
+            lx -= c.tw(t, 9) + 5 * SCALE
+            c.dr.rounded_rectangle([lx - 7 * SCALE, c.y + 3 * SCALE, lx, c.y + 10 * SCALE],
+                                   radius=2 * SCALE, fill=colors[t])
+            lx -= 13 * SCALE
+        c.y += 22 * SCALE
+
+        chart_h = 50 * SCALE
+        base = c.y + 12 * SCALE + chart_h
+        totals = [sum(t.values()) for _, t in daily]
+        top, ticks = nice_ticks(max(totals) or 1)
+        today = today_str()
+
+        # 左侧刻度槽宽度 = 最宽刻度文本 + 间距
+        gut = max((c.tw(fmt_short(tk), 8) for tk in ticks), default=0) + 6 * SCALE
+        x0 = c.pad + gut
+        inner = c.W - c.pad - x0
+        slot = inner / len(daily)
+        bw = min(20 * SCALE, int(slot * 0.62))         # 柱更宽、间距更紧
+
+        # 灰色虚线网格 + 左侧刻度（对齐各段位）
+        for tk in ticks:
+            gy = base - chart_h * tk / top
+            c.dashed_hline(x0, c.W - c.pad, gy)
+            c.text(c.pad + gut - 6 * SCALE, gy - 5.5 * SCALE, fmt_short(tk), 8, c.SUB, anchor="ra")
+        c.dr.line([(x0, base), (c.W - c.pad, base)], fill=c.DIV, width=SCALE)  # 0 基线实线
+
+        peak_i = totals.index(max(totals))
+        for i, (ds, tools) in enumerate(daily):
+            cxx = x0 + slot * i + slot / 2
+            cum = 0
+            for t in order:                            # 底层=周总量最大的工具
+                v = tools.get(t, 0)
+                if not v:
+                    continue
+                h = max(int(chart_h * v / top), 2 * SCALE)
+                y1, y0 = base - cum, base - cum - h
+                if cum + v >= totals[i]:               # 最顶段圆角
+                    c.dr.rounded_rectangle([cxx - bw / 2, y0, cxx + bw / 2, y1],
+                                           radius=2 * SCALE, corners=(True, True, False, False),
+                                           fill=colors[t])
+                else:
+                    c.dr.rectangle([cxx - bw / 2, y0, cxx + bw / 2, y1], fill=colors[t])
+                cum += h
+            if i == peak_i or ds == today:             # 只标峰值和今日
+                wv = totals[i] / 10000
+                vs = f"{wv:.0f}" if wv >= 10 else f"{wv:.1f}"
+                c.text(cxx, base - cum - 12 * SCALE, vs, 8.5, c.SUB, "Medium", anchor="ma")
+            wd = datetime.strptime(ds, "%Y-%m-%d").strftime("%a")   # Mon/Tue/...
+            c.text(cxx, base + 4 * SCALE, wd, 8.5,
+                   c.TEXT if ds == today else c.SUB,
+                   "Semibold" if ds == today else "Regular", anchor="ma")
+        c.y = base + 16 * SCALE
+
+    return c.save(CACHE_DIR / "panel.png")
+
+
+# ---------- 文本模式（Pillow 缺失时兜底） ----------
+def text_menu(usage, cost, cl, cx, rank, dark):
+    C_TEXT = "#ffffff" if dark else "#000000"
+    print(f"今日 {fmt_tokens(usage['total']) if usage else '—'} | size=15 color={C_TEXT}")
+    if rank:
+        print(f"#{rank['rank']} / {rank['total']} · top {rank['top']}% | size=13 color={C_TEXT}")
+    if cost:
+        print(f"今日 ${cost['today']:.2f} 本月 ${cost['month']:,.2f} | size=13 color={C_TEXT}")
+    for label, wins in (("Claude", cl), ("Codex", cx)):
+        for w in (wins or []):
+            cd = countdown(w.get("reset_at"))
+            print(f"{label} {w['kind']} {w['used']}% {('· ' + cd) if cd else ''} | size=13 color={sev_color(w['used'])}")
+
+
+# ---------- 主流程 ----------
+def main():
+    usage = load_usage()
+    cost = load_cost()
+    cx = codex_limits()
+    cl = claude_limits()
+    rank = load_rank()
+    dark = is_dark()
+
+    t = fmt_tokens(usage["total"]) if usage else "—"
+    if rank:
+        t += f" · top {rank['top']}%"
+    icon = claude_icon()
+    print(f" {t} | templateImage={icon}" if icon else f"🎫 {t}")
+    print("---")
+
+    try:
+        strip = render_strip(dark)
+        panel = render_panel(usage, cost, cl, cx, rank, dark)
+        daily = (usage or {}).get("daily") or []
+        tip = " · ".join(f"{ds[5:]} {fmt_tokens(sum(t.values()))}" for ds, t in daily)
+        print(f" | image={strip} refresh=true tooltip=\"刷新\"")
+        print(f" | image={panel} tooltip=\"近7天: {tip}\"")
+        print("---")
+        print("排行榜 ↗ | href=https://scys.com/tokenrank size=12")
+    except Exception:
+        text_menu(usage, cost, cl, cx, rank, dark)
+        print("---")
+        print("↻ 刷新 | refresh=true")
+        print("🏆 打开排行榜 | href=https://scys.com/tokenrank")
+
+
+def human_summary():
+    """终端直跑时的可读总览（插件模式的 base64 是给 SwiftBar 的）。"""
+    usage = load_usage()
+    cost = load_cost()
+    cx = codex_limits()
+    cl = claude_limits()
+    rank = load_rank()
+
+    if usage:
+        tools = "  ".join(f"{t} {fmt_tokens(v)}" for t, v in sorted(usage["tools"].items()))
+        print(f"今日用量  {fmt_tokens(usage['total'])}  ({tools})")
+    if rank:
+        print(f"排名      #{rank['rank']} / {rank['total']} · top {rank['top']}%")
+    if cost:
+        print(f"成本      今日 ${cost['today']:.2f} · 本月 ${cost['month']:,.2f}")
+    for label, wins in (("Claude", cl), ("Codex", cx)):
+        if not wins:
+            print(f"{label:<8}  额度暂不可用")
+            continue
+        parts = []
+        for w in wins:
+            cd = countdown(w.get("reset_at"))
+            parts.append(f"{w['kind']} {w['used']}%" + (f"(重置{cd})" if cd else ""))
+        print(f"{label:<8}  {' · '.join(parts)}")
+    if usage and usage.get("daily"):
+        days = " ".join(f"{ds[8:10]}日{fmt_tokens(v)}" for ds, v in
+                        ((d, sum(t.values())) for d, t in usage["daily"]))
+        print(f"近7天     {days}")
+    running = subprocess.run(["pgrep", "-x", "SwiftBar"], capture_output=True).returncode == 0
+    print()
+    print(f"菜单栏组件: {'运行中(SwiftBar)' if running else '未运行 → tokenrank-menubar start 启动'}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("start", "open"):
+        subprocess.run(["open", "-a", "SwiftBar"])
+        print("✓ SwiftBar 已启动，菜单栏应出现 Token 面板（约几秒后加载数据）")
+    elif os.environ.get("SWIFTBAR") or not sys.stdout.isatty():
+        main()          # SwiftBar 调用 / 管道输出 → 插件格式
+    else:
+        human_summary()  # 终端直跑 → 人类可读总览
