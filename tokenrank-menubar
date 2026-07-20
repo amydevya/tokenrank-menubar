@@ -518,16 +518,26 @@ def render_panel(usage, cost, cl, cx, rank, dark):
             c.y += 19 * SCALE
             continue
         for w in wins:
+            # 主次层级：5h(或唯一窗口)=主指标，weekly=次指标
+            primary = (w["kind"] == "5h") or (len(wins) == 1)
             cy = c.y + 6 * SCALE
-            c.text(c.pad + 6 * SCALE, c.y, w["kind"], 11, c.SUB, "Medium")
-            bh = 7 * SCALE
+            c.text(c.pad + 6 * SCALE, c.y, w["kind"], 11,
+                   c.TEXT if primary else c.SUB, "Medium")
+            bh = (7 if primary else 5) * SCALE          # 次指标条略细
             c.dr.rounded_rectangle([bar_x, cy - bh // 2, bar_x + bar_w, cy + bh // 2],
                                    radius=bh // 2, fill=c.TRACK)
             fw = max(int(bar_w * min(w["used"], 100) / 100), bh if w["used"] > 0 else 0)
             if fw:
                 c.dr.rounded_rectangle([bar_x, cy - bh // 2, bar_x + fw, cy + bh // 2],
                                        radius=bh // 2, fill=sev_color(w["used"]))
-            c.text(c.W - c.pad, c.y, f"{w['used']}%", 12, c.TEXT, "Semibold", anchor="ra")
+            # 百分比：主=大号+始终跟随状态色；次=小号灰，≥60 才变色报警
+            if primary:
+                c.text(c.W - c.pad, c.y - 1 * SCALE, f"{w['used']}%", 13.5,
+                       sev_color(w["used"]), "Semibold", anchor="ra")
+            else:
+                warn = w["used"] >= SEV[1][0]
+                c.text(c.W - c.pad, c.y, f"{w['used']}%", 11.5,
+                       sev_color(w["used"]) if warn else c.SUB, "Semibold", anchor="ra")
             c.y += 16 * SCALE
             cd = countdown(w.get("reset_at"))
             if cd:
