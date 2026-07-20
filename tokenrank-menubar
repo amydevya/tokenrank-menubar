@@ -41,6 +41,7 @@ CLAUDE_TRAY_SRC = Path("/Applications/Claude.app/Contents/Resources/TrayIconTemp
 CACHE_DIR = HOME / ".cache/tokenrank-menubar"
 ICON_CACHE = CACHE_DIR / "claude-tray.png"
 CLAUDE_CACHE = CACHE_DIR / "claude-limits.json"
+CONFIG_PATH = HOME / ".config/tokenrank-menubar/config.json"
 CLAUDE_TTL = 300     # 额度变化慢，5 分钟缓存；插件每 60s 跑但不会每次打 API
 CLAUDE_RETRY = 120   # 失败(如429限流)后至少隔 2 分钟再试
 
@@ -49,7 +50,7 @@ SEV = [(85, "#ff3b30"), (60, "#f7b500"), (0, "#34c759")]
 # 趋势图堆叠用各工具品牌色（与 Token Monitor BRAND_VENDOR_COLORS 同步）
 TOOL_COLORS = {"claude-code": "#cc7c5e", "claude": "#cc7c5e", "codex": "#49a3b0",
                "hermes": "#d4af37", "cursor": "#6ab4f0", "gemini": "#4285f4",
-               "antigravity": "#a57df0", "openclaw": "#f06a7b"}
+               "antigravity": "#a57df0", "openclaw": "#f06a7b", "kimi": "#16191e"}
 TOOL_FALLBACK = "#8e8e93"
 
 SCALE = 2        # @2x 渲染 + 144dpi → retina 清晰
@@ -164,6 +165,35 @@ def pct(v):
     if 0 < v <= 1.0:
         v *= 100
     return round(v)
+
+
+# ---------- 配置（设置界面的持久化） ----------
+def load_config():
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    os.replace(tmp, CONFIG_PATH)
+
+
+def toggle_tool(name):
+    cfg = load_config()
+    hidden = set(cfg.get("hidden_tools", []))
+    if name in hidden:
+        hidden.discard(name)
+        state = "已显示"
+    else:
+        hidden.add(name)
+        state = "已隐藏"
+    cfg["hidden_tools"] = sorted(hidden)
+    save_config(cfg)
+    print(f"{name} {state}")
 
 
 # ---------- 数据采集 ----------
@@ -659,6 +689,19 @@ def main():
     cl = claude_limits()
     rank = load_rank()
     dark = is_dark()
+    hidden = set(load_config().get("hidden_tools", []))
+
+    # 近7天出现过的所有工具（含已隐藏的，供设置菜单列出）
+    all_tools = sorted({tl_k for _, tl in (usage or {}).get("daily", []) for tl_k in tl})
+    # 显示用视图：隐藏的工具从明细/趋势中剔除；总量保持完整（与排行榜口径一致）
+    disp = None
+    if usage:
+        disp = {
+            "total": usage["total"],
+            "tools": {k: v for k, v in usage["tools"].items() if k not in hidden},
+            "daily": [(ds, {k: v for k, v in tl.items() if k not in hidden})
+                      for ds, tl in usage["daily"]],
+        }
 
     t = fmt_tokens(usage["total"]) if usage else "—"
     if rank:
@@ -669,9 +712,9 @@ def main():
 
     try:
         strip = render_strip(dark)
-        panel = render_panel(usage, cost, cl, cx, rank, dark)
-        daily = (usage or {}).get("daily") or []
-        tip = " · ".join(f"{ds[5:]} {fmt_tokens(sum(t.values()))}" for ds, t in daily)
+        panel = render_panel(disp, cost, cl, cx, rank, dark)
+        daily = (disp or {}).get("daily") or []
+        tip = " · ".join(f"{ds[5:]} {fmt_tokens(sum(tl.values()))}" for ds, tl in daily)
         print(f" | image={strip} refresh=true tooltip=\"刷新\"")
         print(f" | image={panel} tooltip=\"近7天: {tip}\"")
         print("---")
@@ -681,6 +724,15 @@ def main():
         print("---")
         print("↻ 刷新 | refresh=true")
         print("🏆 打开排行榜 | href=https://scys.com/tokenrank")
+
+    # 设置子菜单：勾选=显示，圆圈=隐藏；点击即切换并立即刷新
+    if all_tools:
+        print("设置 · 显示哪些工具 | size=12")
+        me = HOME / ".local/bin/tokenrank-menubar"
+        for tool in all_tools:
+            mark = "○" if tool in hidden else "✓"
+            print(f"-- {mark} {tool} | bash=\"{me}\" param1=--toggle-tool param2={tool} "
+                  f"terminal=false refresh=true")
 
 
 def human_summary():
@@ -717,7 +769,9 @@ def human_summary():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("start", "open"):
+    if len(sys.argv) > 2 and sys.argv[1] == "--toggle-tool":
+        toggle_tool(sys.argv[2])
+    elif len(sys.argv) > 1 and sys.argv[1] in ("start", "open"):
         subprocess.run(["open", "-a", "SwiftBar"])
         print("✓ SwiftBar 已启动，菜单栏应出现 Token 面板（约几秒后加载数据）")
     elif os.environ.get("SWIFTBAR") or not sys.stdout.isatty():
