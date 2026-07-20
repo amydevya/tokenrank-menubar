@@ -677,24 +677,21 @@ def render_panel(usage, cost, cl, cx, km, rank, dark):
         colors = {t: TOOL_COLORS.get(t, TOOL_FALLBACK) for t in order}
 
         c.text(c.pad, c.y, "近 7 天用量", 11, c.SUB, "Medium")
-        # 图例：包含图里出现的所有工具（宽度不够才按量从小到大截断）
-        cap_end = c.pad + c.tw("近 7 天用量", 11, "Medium") + 10 * SCALE
-        avail = c.W - c.pad - cap_end
-        shown, used_w = [], 0
+        c.y += 18 * SCALE
+        # 图例独占一行、左对齐、放不下自动换行——对标 Anthropic/OpenAI console：
+        # 图里出现的工具图例必须全部可见，永不截断
+        lx = c.pad
         for t in order:
-            need = c.tw(t, 9) + 25 * SCALE
-            if used_w + need > avail:
-                break
-            shown.append(t)
-            used_w += need
-        lx = c.W - c.pad
-        for t in reversed(shown):                     # 右对齐，视觉顺序=量从大到小
-            c.text(lx, c.y + 1 * SCALE, t, 9, c.SUB, anchor="ra")
-            lx -= c.tw(t, 9) + 5 * SCALE
-            c.dr.rounded_rectangle([lx - 7 * SCALE, c.y + 3 * SCALE, lx, c.y + 10 * SCALE],
+            item_w = 12 * SCALE + c.tw(t, 9) + 14 * SCALE
+            if lx + item_w > c.W - c.pad and lx > c.pad:
+                lx = c.pad
+                c.y += 15 * SCALE                     # 换行
+            c.dr.rounded_rectangle([lx, c.y + 3 * SCALE, lx + 7 * SCALE, c.y + 10 * SCALE],
                                    radius=2 * SCALE, fill=colors[t])
-            lx -= 13 * SCALE
-        c.y += 22 * SCALE
+            lx += 12 * SCALE
+            c.text(lx, c.y + 1 * SCALE, t, 9, c.SUB)
+            lx += c.tw(t, 9) + 14 * SCALE
+        c.y += 20 * SCALE
 
         chart_h = 50 * SCALE
         base = c.y + 12 * SCALE + chart_h
