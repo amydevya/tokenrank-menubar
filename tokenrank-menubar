@@ -41,8 +41,11 @@ CLAUDE_TRAY_SRC = Path("/Applications/Claude.app/Contents/Resources/TrayIconTemp
 CACHE_DIR = HOME / ".cache/tokenrank-menubar"
 ICON_CACHE = CACHE_DIR / "claude-tray.png"
 CLAUDE_CACHE = CACHE_DIR / "claude-limits.json"
+KIMI_CACHE = CACHE_DIR / "kimi-limits.json"
+KIMI_CRED = HOME / ".kimi-code/credentials/kimi-code.json"
+KIMI_USAGES_URL = "https://api.kimi.com/coding/v1/usages"
 CONFIG_PATH = HOME / ".config/tokenrank-menubar/config.json"
-CLAUDE_TTL = 300     # 额度变化慢，5 分钟缓存；插件每 60s 跑但不会每次打 API
+CLAUDE_TTL = 300     # 额度缓存(Claude/Kimi 通用)：额度变化慢，5 分钟够新鲜
 CLAUDE_RETRY = 120   # 失败(如429限流)后至少隔 2 分钟再试
 
 # 额度进度条阈值：默认绿，≥60 黄，≥85 红（Claude/Codex 统一）
@@ -335,20 +338,20 @@ def _claude_fetch():
     return out or None
 
 
-def _cache_write(data):
+def _atomic_json(path, data):
     """原子写：定时跑和手动跑可能并发，write_text 写一半会被读成坏 JSON。"""
-    CLAUDE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CLAUDE_CACHE.with_suffix(".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data))
-    os.replace(tmp, CLAUDE_CACHE)
+    os.replace(tmp, path)
 
 
-def claude_limits():
-    """带缓存: 5 分钟内直接用上次结果；失败(429限流等)沿用旧值并退避 2 分钟。"""
+def _cached_windows(cache_path, fetch):
+    """额度通用缓存: 5 分钟内直接用上次结果；失败(限流/凭证休眠)沿用旧值并退避 2 分钟。"""
     now = time.time()
     cached = {}
     try:
-        cached = json.loads(CLAUDE_CACHE.read_text())
+        cached = json.loads(cache_path.read_text())
     except Exception:
         pass
     if cached.get("windows") and now - cached.get("ts", 0) < CLAUDE_TTL:
@@ -356,18 +359,78 @@ def claude_limits():
     if now - cached.get("attempt_ts", 0) < CLAUDE_RETRY:
         return cached.get("windows") or None
     try:
-        wins = _claude_fetch()
+        wins = fetch()
     except Exception:
         wins = None
     try:
         if wins:
-            _cache_write({"ts": now, "attempt_ts": now, "windows": wins})
+            _atomic_json(cache_path, {"ts": now, "attempt_ts": now, "windows": wins})
             return wins
         cached["attempt_ts"] = now      # windows 原样保留，绝不清掉旧数据
-        _cache_write(cached)
+        _atomic_json(cache_path, cached)
     except Exception:
         pass
     return cached.get("windows") or None
+
+
+def claude_limits():
+    return _cached_windows(CLAUDE_CACHE, _claude_fetch)
+
+
+def _kimi_pct(detail):
+    """Kimi detail{limit,remaining} → used%。"""
+    try:
+        limit = float(detail.get("limit"))
+        remaining = float(detail.get("remaining"))
+        if limit > 0:
+            return round((limit - remaining) / limit * 100)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _kimi_fetch():
+    """Kimi Code 官方 usages 接口：limits[](300min)=5h，usage=weekly。
+    凭证用 Kimi CLI 本地 OAuth token（15分钟短效，CLI 使用时自动续期；过期不强刷）。"""
+    try:
+        cred = json.loads(KIMI_CRED.read_text())
+    except Exception:
+        return None
+    tok = cred.get("access_token")
+    if not tok or float(cred.get("expires_at") or 0) < time.time() + 30:
+        return None
+    req = urllib.request.Request(KIMI_USAGES_URL, headers={
+        "accept": "application/json",
+        "authorization": f"Bearer {tok}",
+        "user-agent": UA,
+    })
+    with urllib.request.urlopen(req, timeout=6) as r:
+        body = json.loads(r.read().decode())
+    out = []
+    for entry in body.get("limits", []):
+        w = entry.get("window") or {}
+        mins = float(w.get("duration") or 0)
+        unit = str(w.get("timeUnit") or "").upper()
+        if "HOUR" in unit:
+            mins *= 60
+        elif "DAY" in unit:
+            mins *= 24 * 60
+        detail = entry.get("detail") or {}
+        up = _kimi_pct(detail)
+        if up is None:
+            continue
+        kind = "5h" if 0 < mins <= 360 else "weekly"
+        out.append({"kind": kind, "used": up, "reset_at": detail.get("resetTime")})
+    u = body.get("usage") or {}
+    up = _kimi_pct(u)
+    if up is not None and not any(w["kind"] == "weekly" for w in out):
+        out.append({"kind": "weekly", "used": up, "reset_at": u.get("resetTime")})
+    out.sort(key=lambda w: 0 if w["kind"] == "5h" else 1)
+    return out or None
+
+
+def kimi_limits():
+    return _cached_windows(KIMI_CACHE, _kimi_fetch)
 
 
 def load_rank():
@@ -528,9 +591,9 @@ def render_strip(dark):
     return c.save(CACHE_DIR / "strip.png")
 
 
-def render_panel(usage, cost, cl, cx, rank, dark):
+def render_panel(usage, cost, cl, cx, km, rank, dark):
     """主面板：总量/排名/分工具 + 成本 + 额度 + 趋势。一整块，不可点击(无悬停高亮)。"""
-    c = Canvas(dark, guess_h=520)
+    c = Canvas(dark, guess_h=760)
 
     # ── 总量 + 排名 ──
     total_s = fmt_tokens(usage["total"]) if usage else "—"
@@ -558,12 +621,18 @@ def render_panel(usage, cost, cl, cx, rank, dark):
     c.y += 21 * SCALE
     bar_x = c.pad + 52 * SCALE
     bar_w = c.W - c.pad - 42 * SCALE - bar_x
-    for label, wins in (("Claude", cl), ("Codex", cx)):
+    NO_DATA_NOTE = {
+        "Claude": "暂不可用（API限流，稍后自动恢复）",
+        "Codex": "本地暂无 rate_limits",
+        "Kimi": "凭证休眠（用一次 Kimi CLI 即恢复）",
+    }
+    for label, wins in (("Claude", cl), ("Codex", cx), ("Kimi", km)):
+        if wins is None and label == "Kimi" and not KIMI_CRED.exists():
+            continue          # 没装/没登录过 Kimi 就不占一行
         c.text(c.pad, c.y, label, 12, c.TEXT, "Semibold")
         c.y += 19 * SCALE
         if wins is None:
-            note = "暂不可用（API限流，稍后自动恢复）" if label == "Claude" else "本地暂无 rate_limits"
-            c.text(c.pad + 6 * SCALE, c.y, note, 10.5, c.SUB)
+            c.text(c.pad + 6 * SCALE, c.y, NO_DATA_NOTE.get(label, "暂不可用"), 10.5, c.SUB)
             c.y += 19 * SCALE
             continue
         for w in wins:
@@ -608,8 +677,18 @@ def render_panel(usage, cost, cl, cx, rank, dark):
         colors = {t: TOOL_COLORS.get(t, TOOL_FALLBACK) for t in order}
 
         c.text(c.pad, c.y, "近 7 天用量", 11, c.SUB, "Medium")
+        # 图例：包含图里出现的所有工具（宽度不够才按量从小到大截断）
+        cap_end = c.pad + c.tw("近 7 天用量", 11, "Medium") + 10 * SCALE
+        avail = c.W - c.pad - cap_end
+        shown, used_w = [], 0
+        for t in order:
+            need = c.tw(t, 9) + 25 * SCALE
+            if used_w + need > avail:
+                break
+            shown.append(t)
+            used_w += need
         lx = c.W - c.pad
-        for t in reversed(order[:3]):                 # 图例右对齐
+        for t in reversed(shown):                     # 右对齐，视觉顺序=量从大到小
             c.text(lx, c.y + 1 * SCALE, t, 9, c.SUB, anchor="ra")
             lx -= c.tw(t, 9) + 5 * SCALE
             c.dr.rounded_rectangle([lx - 7 * SCALE, c.y + 3 * SCALE, lx, c.y + 10 * SCALE],
@@ -640,24 +719,28 @@ def render_panel(usage, cost, cl, cx, rank, dark):
         peak_i = totals.index(max(totals))
         for i, (ds, tools) in enumerate(daily):
             cxx = x0 + slot * i + slot / 2
-            cum = 0
+            cum_px = 0      # 像素累计（画柱用）
+            tok_cum = 0     # token 累计（判断最顶段用）——两者不能混用
             for t in order:                            # 底层=周总量最大的工具
                 v = tools.get(t, 0)
                 if not v:
                     continue
-                h = max(int(chart_h * v / top), 2 * SCALE)
-                y1, y0 = base - cum, base - cum - h
-                if cum + v >= totals[i]:               # 最顶段圆角
+                tok_cum += v
+                h = max(int(chart_h * v / top), SCALE)
+                y1, y0 = base - cum_px, base - cum_px - h
+                # 圆角半径不能超过段高/柱宽的一半，否则 PIL 会因几何非法而崩溃
+                r = min(2 * SCALE, h // 2, int(bw) // 2)
+                if tok_cum >= totals[i] and r >= 1:    # 最顶段圆角
                     c.dr.rounded_rectangle([cxx - bw / 2, y0, cxx + bw / 2, y1],
-                                           radius=2 * SCALE, corners=(True, True, False, False),
+                                           radius=r, corners=(True, True, False, False),
                                            fill=colors[t])
                 else:
                     c.dr.rectangle([cxx - bw / 2, y0, cxx + bw / 2, y1], fill=colors[t])
-                cum += h
+                cum_px += h
             if i == peak_i or ds == today:             # 只标峰值和今日
                 wv = totals[i] / 10000
                 vs = (f"{wv:.0f}" if wv >= 10 else f"{wv:.1f}") + "万"
-                c.text(cxx, base - cum - 12 * SCALE, vs, 8.5, c.SUB, "Medium", anchor="ma")
+                c.text(cxx, base - cum_px - 12 * SCALE, vs, 8.5, c.SUB, "Medium", anchor="ma")
             wd = datetime.strptime(ds, "%Y-%m-%d").strftime("%a")   # Mon/Tue/...
             c.text(cxx, base + 4 * SCALE, wd, 8.5,
                    c.TEXT if ds == today else c.SUB,
@@ -668,14 +751,14 @@ def render_panel(usage, cost, cl, cx, rank, dark):
 
 
 # ---------- 文本模式（Pillow 缺失时兜底） ----------
-def text_menu(usage, cost, cl, cx, rank, dark):
+def text_menu(usage, cost, cl, cx, km, rank, dark):
     C_TEXT = "#ffffff" if dark else "#000000"
     print(f"今日 {fmt_tokens(usage['total']) if usage else '—'} | size=15 color={C_TEXT}")
     if rank:
         print(f"#{rank['rank']} / {rank['total']} · top {rank['top']}% | size=13 color={C_TEXT}")
     if cost:
         print(f"今日 ${cost['today']:.2f} 本月 ${cost['month']:,.2f} | size=13 color={C_TEXT}")
-    for label, wins in (("Claude", cl), ("Codex", cx)):
+    for label, wins in (("Claude", cl), ("Codex", cx), ("Kimi", km)):
         for w in (wins or []):
             cd = countdown(w.get("reset_at"))
             print(f"{label} {w['kind']} {w['used']}% {('· ' + cd) if cd else ''} | size=13 color={sev_color(w['used'])}")
@@ -687,13 +770,12 @@ def main():
     cost = load_cost()
     cx = codex_limits()
     cl = claude_limits()
+    km = kimi_limits()
     rank = load_rank()
     dark = is_dark()
     hidden = set(load_config().get("hidden_tools", []))
 
-    # 近7天出现过的所有工具（含已隐藏的，供设置菜单列出）
-    all_tools = sorted({tl_k for _, tl in (usage or {}).get("daily", []) for tl_k in tl})
-    # 显示用视图：隐藏的工具从明细/趋势中剔除；总量保持完整（与排行榜口径一致）
+    # 显示用视图：隐藏的工具（terminal 里 --toggle-tool 配置）从明细/趋势中剔除；总量保持完整（与排行榜口径一致）
     disp = None
     if usage:
         disp = {
@@ -712,7 +794,7 @@ def main():
 
     try:
         strip = render_strip(dark)
-        panel = render_panel(disp, cost, cl, cx, rank, dark)
+        panel = render_panel(disp, cost, cl, cx, km, rank, dark)
         daily = (disp or {}).get("daily") or []
         tip = " · ".join(f"{ds[5:]} {fmt_tokens(sum(tl.values()))}" for ds, tl in daily)
         print(f" | image={strip} refresh=true tooltip=\"刷新\"")
@@ -720,19 +802,10 @@ def main():
         print("---")
         print("排行榜 ↗ | href=https://scys.com/tokenrank size=12")
     except Exception:
-        text_menu(usage, cost, cl, cx, rank, dark)
+        text_menu(usage, cost, cl, cx, km, rank, dark)
         print("---")
         print("↻ 刷新 | refresh=true")
         print("🏆 打开排行榜 | href=https://scys.com/tokenrank")
-
-    # 设置子菜单：勾选=显示，圆圈=隐藏；点击即切换并立即刷新
-    if all_tools:
-        print("设置 · 显示哪些工具 | size=12")
-        me = HOME / ".local/bin/tokenrank-menubar"
-        for tool in all_tools:
-            mark = "○" if tool in hidden else "✓"
-            print(f"-- {mark} {tool} | bash=\"{me}\" param1=--toggle-tool param2={tool} "
-                  f"terminal=false refresh=true")
 
 
 def human_summary():
@@ -741,6 +814,7 @@ def human_summary():
     cost = load_cost()
     cx = codex_limits()
     cl = claude_limits()
+    km = kimi_limits()
     rank = load_rank()
 
     if usage:
@@ -750,8 +824,10 @@ def human_summary():
         print(f"排名      #{rank['rank']} / {rank['total']} · top {rank['top']}%")
     if cost:
         print(f"成本      今日 ${cost['today']:.2f} · 本月 ${cost['month']:,.2f}")
-    for label, wins in (("Claude", cl), ("Codex", cx)):
+    for label, wins in (("Claude", cl), ("Codex", cx), ("Kimi", km)):
         if not wins:
+            if label == "Kimi" and not KIMI_CRED.exists():
+                continue
             print(f"{label:<8}  额度暂不可用")
             continue
         parts = []
