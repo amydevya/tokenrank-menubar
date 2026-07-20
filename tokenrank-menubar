@@ -625,7 +625,7 @@ def render_panel(usage, cost, cl, cx, rank, dark):
                 cum += h
             if i == peak_i or ds == today:             # 只标峰值和今日
                 wv = totals[i] / 10000
-                vs = f"{wv:.0f}" if wv >= 10 else f"{wv:.1f}"
+                vs = (f"{wv:.0f}" if wv >= 10 else f"{wv:.1f}") + "万"
                 c.text(cxx, base - cum - 12 * SCALE, vs, 8.5, c.SUB, "Medium", anchor="ma")
             wd = datetime.strptime(ds, "%Y-%m-%d").strftime("%a")   # Mon/Tue/...
             c.text(cxx, base + 4 * SCALE, wd, 8.5,
