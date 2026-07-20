@@ -224,8 +224,13 @@ def codex_limits():
         if up is None:
             continue
         mins = int(w.get("window_minutes") or w.get("window_duration_mins") or 0)
-        kind = "weekly" if (mins >= 7 * 24 * 60 or name == "secondary") else "5h"
+        # 优先按窗口时长判断（字段名 primary/secondary 与含义无绑定），名字只兜底
+        if mins:
+            kind = "weekly" if mins >= 7 * 24 * 60 else "5h"
+        else:
+            kind = "weekly" if name == "secondary" else "5h"
         out.append({"kind": kind, "used": up, "reset_at": w.get("resets_at")})
+    out.sort(key=lambda w: 0 if w["kind"] == "5h" else 1)   # 5h 永远排第一
     return out or None
 
 
