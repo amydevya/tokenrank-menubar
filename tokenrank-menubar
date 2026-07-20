@@ -423,14 +423,16 @@ class Canvas:
     def __init__(self, dark, guess_h=400):
         from PIL import Image, ImageDraw
         self.dark = dark
+        # TRACK/DIV/PAST 用预混合实色（=半透明灰叠在衬底上的最终色）。
+        # 不能用带 alpha 的颜色画：PIL Draw 是替换像素而非混合，会在衬底上打洞漏出壁纸。
         if dark:
             self.TEXT, self.SUB = "#f5f5f7", "#a8a8ae"
-            self.TRACK, self.DIV = (255, 255, 255, 56), (255, 255, 255, 40)
+            self.TRACK, self.DIV, self.PAST = (78, 78, 80), (64, 64, 66), (113, 113, 115)
             self.BLUE = "#6ab4f5"
             self.BG = (28, 28, 30, PANEL_BG_ALPHA)
         else:
             self.TEXT, self.SUB = "#111111", "#5f5f64"
-            self.TRACK, self.DIV = (0, 0, 0, 34), (0, 0, 0, 26)
+            self.TRACK, self.DIV, self.PAST = (221, 221, 223), (229, 229, 231), (191, 191, 193)
             self.BLUE = "#1a56db"
             self.BG = (255, 255, 255, PANEL_BG_ALPHA)
         self.W = PANEL_W * SCALE
