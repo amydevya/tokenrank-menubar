@@ -433,6 +433,18 @@ def kimi_limits():
     return _cached_windows(KIMI_CACHE, _kimi_fetch)
 
 
+def ordered_providers(cl, cx, km):
+    """额度爆红(任一窗口 ≥85%)的模型沉到最后——用户反正用不了，注意力留给能用的。
+    稳定排序：同组内保持 Claude→Codex→Kimi 原顺序；无数据的不算红，位置不变。"""
+    provs = [("Claude", cl), ("Codex", cx), ("Kimi", km)]
+    red_thresh = SEV[0][0]
+
+    def is_red(wins):
+        return bool(wins) and max((w["used"] for w in wins), default=0) >= red_thresh
+
+    return sorted(provs, key=lambda p: 1 if is_red(p[1]) else 0)
+
+
 def load_rank():
     try:
         uid = USER_ID_FILE.read_text().strip()
@@ -626,7 +638,7 @@ def render_panel(usage, cost, cl, cx, km, rank, dark):
         "Codex": "本地暂无 rate_limits",
         "Kimi": "凭证休眠（用一次 Kimi CLI 即恢复）",
     }
-    for label, wins in (("Claude", cl), ("Codex", cx), ("Kimi", km)):
+    for label, wins in ordered_providers(cl, cx, km):
         if wins is None and label == "Kimi" and not KIMI_CRED.exists():
             continue          # 没装/没登录过 Kimi 就不占一行
         c.text(c.pad, c.y, label, 12, c.TEXT, "Semibold")
@@ -755,7 +767,7 @@ def text_menu(usage, cost, cl, cx, km, rank, dark):
         print(f"#{rank['rank']} / {rank['total']} · top {rank['top']}% | size=13 color={C_TEXT}")
     if cost:
         print(f"今日 ${cost['today']:.2f} 本月 ${cost['month']:,.2f} | size=13 color={C_TEXT}")
-    for label, wins in (("Claude", cl), ("Codex", cx), ("Kimi", km)):
+    for label, wins in ordered_providers(cl, cx, km):
         for w in (wins or []):
             cd = countdown(w.get("reset_at"))
             print(f"{label} {w['kind']} {w['used']}% {('· ' + cd) if cd else ''} | size=13 color={sev_color(w['used'])}")
@@ -821,7 +833,7 @@ def human_summary():
         print(f"排名      #{rank['rank']} / {rank['total']} · top {rank['top']}%")
     if cost:
         print(f"成本      今日 ${cost['today']:.2f} · 本月 ${cost['month']:,.2f}")
-    for label, wins in (("Claude", cl), ("Codex", cx), ("Kimi", km)):
+    for label, wins in ordered_providers(cl, cx, km):
         if not wins:
             if label == "Kimi" and not KIMI_CRED.exists():
                 continue
