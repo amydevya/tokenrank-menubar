@@ -41,7 +41,9 @@ CLAUDE_TRAY_SRC = Path("/Applications/Claude.app/Contents/Resources/TrayIconTemp
 CACHE_DIR = HOME / ".cache/tokenrank-menubar"
 ICON_CACHE = CACHE_DIR / "claude-tray.png"
 CLAUDE_CACHE = CACHE_DIR / "claude-limits.json"
+CODEX_CACHE = CACHE_DIR / "codex-limits.json"
 KIMI_CACHE = CACHE_DIR / "kimi-limits.json"
+CODEX_TAIL_BYTES = 256 * 1024   # rollout 可达上百MB，只读尾部找最新 rate_limits
 KIMI_CRED = HOME / ".kimi-code/credentials/kimi-code.json"
 KIMI_USAGES_URL = "https://api.kimi.com/coding/v1/usages"
 CONFIG_PATH = HOME / ".config/tokenrank-menubar/config.json"
@@ -239,32 +241,11 @@ def load_cost():
     return {"today": float(t.get("costUsd") or 0), "month": float(m.get("costUsd") or 0)}
 
 
-def codex_limits():
-    files = sorted(glob.glob(str(CODEX_SESSIONS / "**/*.jsonl"), recursive=True),
-                   key=lambda p: os.path.getmtime(p), reverse=True)[:8]
-    best_ts, best = None, None
-    for f in files:
-        try:
-            lines = Path(f).read_text(errors="ignore").splitlines()
-        except Exception:
-            continue
-        for line in reversed(lines):
-            if '"rate_limits"' not in line:
-                continue
-            try:
-                o = json.loads(line)
-            except Exception:
-                continue
-            rl = _find(o, "rate_limits")
-            ts = _find(o, "timestamp")
-            if rl and (best_ts is None or str(ts) > str(best_ts)):
-                best_ts, best = ts, rl
-            break
-    if not best:
-        return None
+def _codex_parse(rl):
+    """rate_limits 事件 → 窗口列表。空快照(如 limit_id=premium 的探测事件)返回 []。"""
     out = []
     for name in ("primary", "secondary"):
-        w = best.get(name)
+        w = (rl or {}).get(name)
         if not isinstance(w, dict):
             continue
         up = pct(w.get("used_percent"))
@@ -278,7 +259,41 @@ def codex_limits():
             kind = "weekly" if name == "secondary" else "5h"
         out.append({"kind": kind, "used": up, "reset_at": w.get("resets_at")})
     out.sort(key=lambda w: 0 if w["kind"] == "5h" else 1)   # 5h 永远排第一
-    return out or None
+    return out
+
+
+def _codex_scan():
+    files = sorted(glob.glob(str(CODEX_SESSIONS / "**/*.jsonl"), recursive=True),
+                   key=lambda p: os.path.getmtime(p), reverse=True)[:12]
+    best_ts, best = None, None
+    for f in files:
+        try:  # 只读尾部：rollout 可达上百MB，整读会每分钟白耗几百MB IO
+            size = os.path.getsize(f)
+            with open(f, "rb") as fh:
+                fh.seek(max(0, size - CODEX_TAIL_BYTES))
+                lines = fh.read().decode("utf-8", "ignore").splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue    # 尾部截断导致的半行，继续往上
+            wins = _codex_parse(_find(o, "rate_limits"))
+            if not wins:
+                continue    # 空快照跳过，继续往上找该文件里最近的有效事件
+            ts = _find(o, "timestamp")
+            if best_ts is None or str(ts) > str(best_ts):
+                best_ts, best = ts, wins
+            break           # 此文件已取到最新有效快照
+    return best
+
+
+def codex_limits():
+    """缓存兜底：切号/新会话导致的暂时断档显示上次已知额度，而不是整块消失。"""
+    return _cached_windows(CODEX_CACHE, _codex_scan)
 
 
 def _find(o, key):
@@ -434,15 +449,18 @@ def kimi_limits():
 
 
 def ordered_providers(cl, cx, km):
-    """额度爆红(任一窗口 ≥85%)的模型沉到最后——用户反正用不了，注意力留给能用的。
-    稳定排序：同组内保持 Claude→Codex→Kimi 原顺序；无数据的不算红，位置不变。"""
+    """当下不可用的模型沉底，注意力留给能用的：
+    正常(0) → 爆红≥85%(1) → 无数据(2，最末)。同档内保持 Claude→Codex→Kimi 稳定顺序。"""
     provs = [("Claude", cl), ("Codex", cx), ("Kimi", km)]
     red_thresh = SEV[0][0]
 
-    def is_red(wins):
-        return bool(wins) and max((w["used"] for w in wins), default=0) >= red_thresh
+    def key(p):
+        wins = p[1]
+        if not wins:
+            return 2
+        return 1 if max(w["used"] for w in wins) >= red_thresh else 0
 
-    return sorted(provs, key=lambda p: 1 if is_red(p[1]) else 0)
+    return sorted(provs, key=key)
 
 
 def load_rank():
